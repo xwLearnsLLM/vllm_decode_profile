@@ -61,7 +61,8 @@ VLLM_ENABLE_PROFILE=0 PYTHONPATH=$PWD:$PYTHONPATH python3 profile_vllm.py
 如果想采 profile：
 
 ```bash
-VLLM_ENABLE_PROFILE=1 VLLM_PROFILE_DIR=$PWD/profiles/with_profile_$(date +%Y%m%d_%H%M%S) PYTHONPATH=$PWD:$PYTHONPATH python3 profile_vllm.py
+export VLLM_PROFILE_DIR=$PWD/profiles/with_profile_$(date +%Y%m%d_%H%M%S)
+VLLM_ENABLE_PROFILE=1 PYTHONPATH=$PWD:$PYTHONPATH python3 profile_vllm.py
 ```
 
 　
