@@ -7,9 +7,7 @@
 - 强制使用 `FULL_DECODE_ONLY`，只 capture 实际 batch size。
 - profiler 只在指定 global rank 上创建；TP-only 场景下 global rank 0 就是 TP rank 0。
 - profiling worker 仅用于控制采集窗口；EP 通信后端显式保持为 vLLM-Ascend baseline 默认选择的 `flashinfer_all2allv`。
-- `start_profile()` 只负责武装 profiler。worker 观察到完整 batch 首次进入 纯 single-token decode 时才真正开始采集，程序生成结束时停止。
 - chunk prefill、混合 prefill/decode 以及不完整 decode batch 都不会触发 profiler；首次完整 batch 纯 decode 触发后，会持续采集到本次生成结束。
-- 纯 single-token decode step 会记录 BS、token 数、EngineCore TPOT、各请求当前序列长度和逻辑 HBM KV-block 使用量；所有记录在请求结束后一次性打印，避免 stdout 放大相邻 decode step 的空隙。
 
 　
 
@@ -19,7 +17,7 @@
 
 　
 
-## 使用方法举例：TP16、BS6、30K序列长度的信息采集
+## 使用方法举例
 
 在仓库根目录，先做一些基础配置：
 
@@ -52,11 +50,15 @@ export VLLM_PROFILE_GLOBAL_RANK=0
 export VLLM_PROMPT_LENGTHS=25000,25001,25002,25003,25004,25005
 ```
 
-然后运行推理。如果不想采集profile，只想看每个 decode-step 的 batchsize、TPOT等信息：
+#### 运行推理（不采集profile）
+
+如果不想采集profile，只想看每个 decode-step 的 batchsize、TPOT等信息：
 
 ```bash
 VLLM_ENABLE_PROFILE=0 PYTHONPATH=$PWD:$PYTHONPATH python3 profile_vllm.py
 ```
+
+#### 运行推理（采集profile）
 
 如果想采 profile：
 
@@ -65,9 +67,30 @@ export VLLM_PROFILE_DIR=$PWD/profiles/with_profile_$(date +%Y%m%d_%H%M%S)
 VLLM_ENABLE_PROFILE=1 PYTHONPATH=$PWD:$PYTHONPATH python3 profile_vllm.py
 ```
 
+然后运行如下命令导出 profile ：
+
+```bash
+python3 parse_profile.py
+```
+
+该脚本会自动找到唯一的 rank-0 `*ascend_pt` 原始目录；尚未解析时调用 `torch_npu.profiler.profiler.analyse()`，已经存在 `ASCEND_PROFILER_OUTPUT` 时则直接复用，并打印输出目录及 `trace_view.json` 路径。
+
+然后你就可以手动把 `trace_view.json` 下载到本地，用 MindStudio Insight 软件查看。
+
 　
 
-常用参数如下：
+## Decode-step 打印信息统计
+
+无论是否生成 profile ，生成结束时会一次性输出本轮所有纯 decode step 的 batchsize, TPOT 等信息，例如：
+
+```text
+[VLLM_DECODE step=0001] bsz=6, num_tokens=6, TPOT=68.420 ms, seq_lens=[30001, 30002, 30003, 30004, 30005, 30006], HBM_KV=1407/1680 blocks (83.75%)
+[VLLM_DECODE step=0002] bsz=6, num_tokens=6, TPOT=67.981 ms, seq_lens=[30002, 30003, 30004, 30005, 30006, 30007], HBM_KV=1407/1680 blocks (83.75%)
+```
+
+　
+
+## 附录A：常用参数如下：
 
 | 参数                          |                    默认值 | 说明                                                         |
 | ----------------------------- | ------------------------: | ------------------------------------------------------------ |
@@ -86,33 +109,8 @@ scheduler 中按 chunk 同步推进，最终仍会形成完整 batch 的纯 deco
 
 　
 
-## Decode-step 打印信息统计
 
-生成结束时会一次性输出本轮所有纯 single-token decode step，例如：
-
-```text
-[VLLM_DECODE step=0001] bsz=6, num_tokens=6, TPOT=68.420 ms, seq_lens=[30001, 30002, 30003, 30004, 30005, 30006], HBM_KV=1407/1680 blocks (83.75%)
-[VLLM_DECODE step=0002] bsz=6, num_tokens=6, TPOT=67.981 ms, seq_lens=[30002, 30003, 30004, 30005, 30006, 30007], HBM_KV=1407/1680 blocks (83.75%)
-```
-
-　
-
-## 解析和查看 profile
-
-如果推理时设置了 `VLLM_ENABLE_PROFILE=1` 并导出了 `VLLM_PROFILE_DIR` 环境变量，运行：
-
-```bash
-python3 parse_profile.py
-```
-
-该脚本会自动找到唯一的 rank-0 `*ascend_pt` 原始目录；尚未解析时调用 `torch_npu.profiler.profiler.analyse()`，已经存在 `ASCEND_PROFILER_OUTPUT` 时则直接复用，并打印输出目录及 `trace_view.json` 路径。
-
-然后你就可以手动把 `trace_view.json` 下载到本地，用 MindStudio Insight 软件查看。
-
-　
-
-
-## 附录：必须检查的运行日志
+## 附录B：运行 vLLM 后需要检查的运行日志
 
 运行 vLLM 时，初始化后必须看到：
 

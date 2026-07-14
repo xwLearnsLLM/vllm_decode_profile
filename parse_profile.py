@@ -114,7 +114,7 @@ def main() -> None:
         trace_files = sorted(analysis_dir.rglob("trace_view.json"))
         if trace_files:
             for trace_file in trace_files:
-                print(f"trace view     : {trace_file}")
+                print(f"\n\n Now you can use MindStudio Insight to open : {trace_file} \n")
         else:
             print("trace view     : not found")
 
