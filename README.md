@@ -86,9 +86,35 @@ scheduler 中按 chunk 同步推进，最终仍会形成完整 batch 的纯 deco
 
 　
 
-## 必须检查的运行日志
+## Decode-step 打印信息统计
 
-初始化后必须看到：
+生成结束时会一次性输出本轮所有纯 single-token decode step，例如：
+
+```text
+[VLLM_DECODE step=0001] bsz=6, num_tokens=6, TPOT=68.420 ms, seq_lens=[30001, 30002, 30003, 30004, 30005, 30006], HBM_KV=1407/1680 blocks (83.75%)
+[VLLM_DECODE step=0002] bsz=6, num_tokens=6, TPOT=67.981 ms, seq_lens=[30002, 30003, 30004, 30005, 30006, 30007], HBM_KV=1407/1680 blocks (83.75%)
+```
+
+　
+
+## 解析和查看 profile
+
+如果推理时设置了 `VLLM_ENABLE_PROFILE=1` 并导出了 `VLLM_PROFILE_DIR` 环境变量，运行：
+
+```bash
+python3 parse_profile.py
+```
+
+该脚本会自动找到唯一的 rank-0 `*ascend_pt` 原始目录；尚未解析时调用 `torch_npu.profiler.profiler.analyse()`，已经存在 `ASCEND_PROFILER_OUTPUT` 时则直接复用，并打印输出目录及 `trace_view.json` 路径。
+
+然后你就可以手动把 `trace_view.json` 下载到本地，用 MindStudio Insight 软件查看。
+
+　
+
+
+## 附录：必须检查的运行日志
+
+运行 vLLM 时，初始化后必须看到：
 
 ```text
 effective runtime config: cudagraph_mode=...FULL_DECODE_ONLY..., capture_sizes=[6], all2all_backend=flashinfer_all2allv, scheduler_cls=vllm_decode_profile.profile_scheduler.DecodeStepLoggingScheduler
@@ -111,49 +137,5 @@ VLLM_BASELINE_PROFILE_STOPPED rank=0
 profiling is disabled; decode-step statistics remain enabled
 profile disabled by VLLM_ENABLE_PROFILE=0
 ```
-
-　
-
-## Decode-step 打印信息统计
-
-生成结束时会一次性输出本轮所有纯 single-token decode step，例如：
-
-```text
-[VLLM_DECODE step=0001] bsz=6, num_tokens=6, TPOT=68.420 ms, seq_lens=[30001, 30002, 30003, 30004, 30005, 30006], HBM_KV=1407/1680 blocks (83.75%)
-[VLLM_DECODE step=0002] bsz=6, num_tokens=6, TPOT=67.981 ms, seq_lens=[30002, 30003, 30004, 30005, 30006, 30007], HBM_KV=1407/1680 blocks (83.75%)
-```
-
-　
-
-## 解析和查看 profile
-
-如果你在推理时设置了 `VLLM_ENABLE_PROFILE=1` 和 `VLLM_PROFILE_DIR` ，则可以输出 profile ，并用 
-
-先找到唯一的 rank-0 原始目录：
-
-```bash
-find "$VLLM_PROFILE_DIR" -type d -name '*ascend_pt'
-```
-
-如果目录下还没有 `ASCEND_PROFILER_OUTPUT`，手动执行分析：
-
-```bash
-RAW_PROFILE_DIR=$(find "$VLLM_PROFILE_DIR" -type d -name '*ascend_pt' | head -n 1)
-
-python3 - "$RAW_PROFILE_DIR" <<'PY'
-import sys
-from torch_npu.profiler.profiler import analyse
-
-analyse(sys.argv[1])
-PY
-```
-
-分析完成后查找：
-
-```bash
-find "$RAW_PROFILE_DIR" -path '*/ASCEND_PROFILER_OUTPUT/trace_view.json'
-```
-
-使用 MindStudio Insight 打开 `trace_view.json` 或其所在的`ASCEND_PROFILER_OUTPUT` 目录。重点观察中间几个稳定 decode step；首次 decode step 可能包含 profiler 启动开销，不用于 TPOT 对比。
 
 　
