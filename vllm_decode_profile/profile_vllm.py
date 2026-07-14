@@ -251,8 +251,10 @@ def main() -> None:
         ),
         enable_prefix_caching=False,
         enable_chunked_prefill=True,
-        max_num_partial_prefills=batch_size,
-        max_long_partial_prefills=batch_size,
+        # vLLM 0.19 rejects non-default Concurrent Partial Prefill knobs.
+        # Keeping their defaults (both 1) does not serialize this V1
+        # scheduler: the shared token budget plus this per-request threshold
+        # still lets all requests advance one chunk in the same engine step.
         long_prefill_token_threshold=prefill_chunk_tokens,
         async_scheduling=False,
         scheduler_cls=SCHEDULER_CLASS,

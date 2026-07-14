@@ -80,6 +80,11 @@ VLLM_ENABLE_PROFILE=1 VLLM_PROFILE_DIR=$PWD/profiles/with_profile_$(date +%Y%m%d
 | `VLLM_GPU_MEMORY_UTILIZATION` |                    `0.95` | vLLM NPU 显存利用率                                          |
 | `VLLM_PROFILE_FLUSH_SECONDS`  |                      `10` | `stop_profile()` 后等待文件落盘的秒数                        |
 
+脚本不会设置 `max_num_partial_prefills` 或 `max_long_partial_prefills`。vLLM
+0.19 会拒绝非默认值并报 `Concurrent Partial Prefill is not supported`；这里通过
+`max_num_batched_tokens` 和 `long_prefill_token_threshold` 让同一批请求在 V1
+scheduler 中按 chunk 同步推进，最终仍会形成完整 batch 的纯 decode step。
+
 
 
 ## 必须检查的运行日志
