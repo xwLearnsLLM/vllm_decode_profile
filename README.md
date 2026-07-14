@@ -5,33 +5,23 @@
 脚本具有以下约束：
 
 - 强制使用 `FULL_DECODE_ONLY`，只 capture 实际 batch size。
-- 内置 Hawthorn Bridge 长文本 prompt，
-  并直接传入精确长度的 token IDs。
-- prompt 长度列表中的元素数量就是 batch size。
-- profiler 只在指定 global rank 上创建；TP-only 场景下 global rank 0 就是
-  TP rank 0。
-- profiling worker 仅用于控制采集窗口；EP 通信后端显式保持为 vLLM-Ascend
-  baseline 默认选择的 `flashinfer_all2allv`。
-- `start_profile()` 只负责武装 profiler。worker 观察到完整 batch 首次进入
-  纯 single-token decode 时才真正开始采集，程序生成结束时停止。
-- chunk prefill、混合 prefill/decode 以及不完整 decode batch 都不会触发 profiler；
-  首次完整 batch 纯 decode 触发后，会持续采集到本次生成结束。
-- 纯 single-token decode step 会记录 BS、token 数、EngineCore TPOT、各请求当前
-  序列长度和逻辑 HBM KV-block 使用量；所有记录在请求结束后一次性打印，避免
-  stdout 放大相邻 decode step 的空隙。
-- `VLLM_ENABLE_PROFILE=0` 时完全不启动 profiler，但仍输出上述 decode-step 统计。
+- profiler 只在指定 global rank 上创建；TP-only 场景下 global rank 0 就是 TP rank 0。
+- profiling worker 仅用于控制采集窗口；EP 通信后端显式保持为 vLLM-Ascend baseline 默认选择的 `flashinfer_all2allv`。
+- `start_profile()` 只负责武装 profiler。worker 观察到完整 batch 首次进入 纯 single-token decode 时才真正开始采集，程序生成结束时停止。
+- chunk prefill、混合 prefill/decode 以及不完整 decode batch 都不会触发 profiler；首次完整 batch 纯 decode 触发后，会持续采集到本次生成结束。
+- 纯 single-token decode step 会记录 BS、token 数、EngineCore TPOT、各请求当前序列长度和逻辑 HBM KV-block 使用量；所有记录在请求结束后一次性打印，避免 stdout 放大相邻 decode step 的空隙。
 
-
+　
 
 ## 环境要求
 
 仓库运行时只需要目标环境已经安装 vLLM 和 vLLM-Ascend。
 
-
+　
 
 ## 使用方法举例：TP16、BS6、30K序列长度的信息采集
 
-在仓库根目录运行：
+在仓库根目录，先做一些基础配置：
 
 ```bash
 export PYTORCH_NPU_ALLOC_CONF=expandable_segments:True
@@ -45,9 +35,6 @@ export VLLM_KVCACHE_BLOCK_SIZE=128
 export VLLM_ENFORCE_EAGER=0
 export VLLM_ENABLE_PROFILE=1
 
-# 这里相当于 bs=6, seqlen=25k
-export VLLM_PROMPT_LENGTHS=25000,25001,25002,25003,25004,25005
-
 # 推荐 8～16，以便采到多个稳定 decode step。
 export VLLM_MAX_GEN_TOKENS=8
 
@@ -55,18 +42,29 @@ export VLLM_MAX_GEN_TOKENS=8
 export VLLM_MAX_NUM_BATCHED_TOKENS=4096
 export VLLM_GPU_MEMORY_UTILIZATION=0.95
 
-# TP-only 时 global rank 0 即 TP rank 0。
+# 设置成只采集 TP rank 0
 export VLLM_PROFILE_GLOBAL_RANK=0
-export VLLM_PROFILE_DIR=$PWD/profiles/tp16_bs6_seq30k_$(date +%Y%m%d_%H%M%S)
+```
 
-# 运行推理（不采 profile，只打印 decode-step TPOT，不会等待 profile 落盘，避免 profile 开销）
+设置你想采集的测试用例，例如如果你想采集 bs=6, seqlen=25k ，则这样设置：
+
+```bash
+export VLLM_PROMPT_LENGTHS=25000,25001,25002,25003,25004,25005
+```
+
+然后运行推理。如果不想采集profile，只想看每个 decode-step 的 batchsize、TPOT等信息：
+
+```bash
 VLLM_ENABLE_PROFILE=0 PYTHONPATH=$PWD:$PYTHONPATH python3 profile_vllm.py
+```
 
-# 运行推理（采 profile，同时打印相同口径的 decode-step TPOT）
+如果想采 profile：
+
+```bash
 VLLM_ENABLE_PROFILE=1 VLLM_PROFILE_DIR=$PWD/profiles/with_profile_$(date +%Y%m%d_%H%M%S) PYTHONPATH=$PWD:$PYTHONPATH python3 profile_vllm.py
 ```
 
-
+　
 
 常用参数如下：
 
@@ -85,7 +83,7 @@ VLLM_ENABLE_PROFILE=1 VLLM_PROFILE_DIR=$PWD/profiles/with_profile_$(date +%Y%m%d
 `max_num_batched_tokens` 和 `long_prefill_token_threshold` 让同一批请求在 V1
 scheduler 中按 chunk 同步推进，最终仍会形成完整 batch 的纯 decode step。
 
-
+　
 
 ## 必须检查的运行日志
 
@@ -104,13 +102,7 @@ VLLM_BASELINE_PROFILE_STARTED rank=0 batch=6 phase=decode
 VLLM_BASELINE_PROFILE_STOPPED rank=0
 ```
 
-只有 rank 0 会真正创建 profiler，因此输出目录中正常情况下只有带 `tp0` 的 `*ascend_pt` 数据。如果出现：
-
-```text
-VLLM_BASELINE_PROFILE_NOT_STARTED
-```
-
-说明运行期间没有形成 BS6 的纯 single-token decode step。优先检查 prompt 长度是否过于悬殊、生成 token 是否太少，以及 KV cache 是否足以让全部请求同时驻留。
+只有 rank 0 会真正创建 profiler，因此输出目录中正常情况下只有带 `tp0` 的 `*ascend_pt` 数据。如果出现 `VLLM_BASELINE_PROFILE_NOT_STARTED` ，说明运行期间没有形成 BS6 的纯 single-token decode step。优先检查 prompt 长度是否过于悬殊、生成 token 是否太少，以及 KV cache 是否足以让全部请求同时驻留。
 
 `VLLM_ENABLE_PROFILE=0` 时不会出现上述 profile marker，而会打印：
 
@@ -119,24 +111,22 @@ profiling is disabled; decode-step statistics remain enabled
 profile disabled by VLLM_ENABLE_PROFILE=0
 ```
 
-
+　
 
 ## Decode-step 打印信息统计
 
 生成结束时会一次性输出本轮所有纯 single-token decode step，例如：
 
 ```text
-VLLM_DECODE_STEP_LOG_BEGIN count=7
 [VLLM_DECODE step=0001] bsz=6, num_tokens=6, TPOT=68.420 ms, seq_lens=[30001, 30002, 30003, 30004, 30005, 30006], HBM_KV=1407/1680 blocks (83.75%)
 [VLLM_DECODE step=0002] bsz=6, num_tokens=6, TPOT=67.981 ms, seq_lens=[30002, 30003, 30004, 30005, 30006, 30007], HBM_KV=1407/1680 blocks (83.75%)
-VLLM_DECODE_STEP_LOG_END
 ```
 
+　
 
+## 解析和查看 profile
 
-## 解析并用 MindStudio Insight 查看输出的 profile
-
-本节只适用于 `VLLM_ENABLE_PROFILE=1`。
+如果你在推理时设置了 `VLLM_ENABLE_PROFILE=1` 和 `VLLM_PROFILE_DIR` ，则可以输出 profile ，并用 
 
 先找到唯一的 rank-0 原始目录：
 
@@ -164,3 +154,5 @@ find "$RAW_PROFILE_DIR" -path '*/ASCEND_PROFILER_OUTPUT/trace_view.json'
 ```
 
 使用 MindStudio Insight 打开 `trace_view.json` 或其所在的`ASCEND_PROFILER_OUTPUT` 目录。重点观察中间几个稳定 decode step；首次 decode step 可能包含 profiler 启动开销，不用于 TPOT 对比。
+
+　
