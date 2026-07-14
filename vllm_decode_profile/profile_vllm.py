@@ -156,8 +156,11 @@ def main() -> None:
         "VLLM_MAX_NUM_BATCHED_TOKENS",
         DEFAULT_MAX_NUM_BATCHED_TOKENS,
     )
+    enable_profile = env_bool("VLLM_ENABLE_PROFILE", True)
     target_rank = env_int("VLLM_PROFILE_GLOBAL_RANK", 0)
-    profile_dir = _profile_dir(tp_size, batch_size)
+    profile_dir = (
+        _profile_dir(tp_size, batch_size) if enable_profile else None
+    )
     prefill_chunk_tokens = env_int(
         "VLLM_PREFILL_CHUNK_TOKENS",
         max(1, max_num_batched_tokens // batch_size),
@@ -183,12 +186,13 @@ def main() -> None:
             "VLLM_ENFORCE_EAGER must be 0"
         )
 
-    if profile_dir.exists() and any(profile_dir.iterdir()):
-        raise RuntimeError(
-            f"VLLM_PROFILE_DIR must be empty, got non-empty directory: "
-            f"{profile_dir}"
-        )
-    profile_dir.mkdir(parents=True, exist_ok=True)
+    if profile_dir is not None:
+        if profile_dir.exists() and any(profile_dir.iterdir()):
+            raise RuntimeError(
+                f"VLLM_PROFILE_DIR must be empty, got non-empty directory: "
+                f"{profile_dir}"
+            )
+        profile_dir.mkdir(parents=True, exist_ok=True)
     os.environ["VLLM_PROFILE_EXPECTED_BATCH_SIZE"] = str(batch_size)
     os.environ["VLLM_PROFILE_GLOBAL_RANK"] = str(target_rank)
 
@@ -213,14 +217,16 @@ def main() -> None:
     )
 
     print(
-        "vLLM baseline profile config: "
+        "vLLM decode run config: "
         f"model={model_path}, tp={tp_size}, ep={enable_expert_parallel}, "
         f"batch={batch_size}, prompt_lengths={prompt_lengths}, "
         f"max_model_len={max_model_len}, max_gen_tokens={max_gen_tokens}, "
         f"max_num_batched_tokens={max_num_batched_tokens}, "
         f"per_request_prefill_chunk_cap={prefill_chunk_tokens}, "
         f"all2all_backend={BASELINE_ALL2ALL_BACKEND}, "
-        f"profile_global_rank={target_rank}, profile_dir={profile_dir}"
+        f"profile_enabled={enable_profile}, "
+        f"profile_global_rank={target_rank}, "
+        f"profile_dir={profile_dir if profile_dir is not None else 'disabled'}"
     )
     print("runtime: native vLLM + vLLM-Ascend baseline")
 
@@ -258,13 +264,17 @@ def main() -> None:
             "cudagraph_mode": "FULL_DECODE_ONLY",
             "cudagraph_capture_sizes": [batch_size],
         },
-        profiler_config={
-            "profiler": "torch",
-            "torch_profiler_dir": str(profile_dir),
-            "torch_profiler_with_stack": False,
-            "torch_profiler_record_shapes": False,
-            "torch_profiler_with_memory": False,
-        },
+        profiler_config=(
+            {
+                "profiler": "torch",
+                "torch_profiler_dir": str(profile_dir),
+                "torch_profiler_with_stack": False,
+                "torch_profiler_record_shapes": False,
+                "torch_profiler_with_memory": False,
+            }
+            if enable_profile
+            else None
+        ),
     )
     _print_effective_runtime_config(
         llm,
@@ -298,25 +308,35 @@ def main() -> None:
         ignore_eos=True,
     )
 
-    print(
-        "profiling is armed now; "
-        f"rank {target_rank} starts recording only when the full batch "
-        "reaches pure single-token decode"
-    )
+    if enable_profile:
+        print(
+            "profiling is armed now; "
+            f"rank {target_rank} starts recording only when the full batch "
+            "reaches pure single-token decode"
+        )
+    else:
+        print(
+            "profiling is disabled; decode-step statistics remain enabled"
+        )
     outputs = None
-    llm.start_profile(profile_prefix=profile_prefix)
+    profile_armed = False
     try:
+        if enable_profile:
+            llm.start_profile(profile_prefix=profile_prefix)
+            profile_armed = True
         outputs = llm.generate(
             token_prompts,
             sampling_params,
             use_tqdm=False,
         )
     finally:
-        llm.stop_profile()
+        if profile_armed:
+            llm.stop_profile()
 
-    flush_seconds = env_float("VLLM_PROFILE_FLUSH_SECONDS", 10.0)
-    if flush_seconds > 0:
-        time.sleep(flush_seconds)
+    if enable_profile:
+        flush_seconds = env_float("VLLM_PROFILE_FLUSH_SECONDS", 10.0)
+        if flush_seconds > 0:
+            time.sleep(flush_seconds)
 
     assert outputs is not None
     for index, (token_ids, output) in enumerate(
@@ -329,11 +349,14 @@ def main() -> None:
         print("token_ids :", completion.token_ids)
         print()
 
-    print(f"profile saved to: {profile_dir}")
-    print(
-        "required worker markers: VLLM_BASELINE_PROFILE_STARTED and "
-        "VLLM_BASELINE_PROFILE_STOPPED"
-    )
+    if enable_profile:
+        print(f"profile saved to: {profile_dir}")
+        print(
+            "required worker markers: VLLM_BASELINE_PROFILE_STARTED and "
+            "VLLM_BASELINE_PROFILE_STOPPED"
+        )
+    else:
+        print("profile disabled by VLLM_ENABLE_PROFILE=0")
 
 
 if __name__ == "__main__":

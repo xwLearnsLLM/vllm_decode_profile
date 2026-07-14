@@ -19,6 +19,7 @@
 - 纯 single-token decode step 会记录 BS、token 数、EngineCore TPOT、各请求当前
   序列长度和逻辑 HBM KV-block 使用量；所有记录在请求结束后一次性打印，避免
   stdout 放大相邻 decode step 的空隙。
+- `VLLM_ENABLE_PROFILE=0` 时完全不启动 profiler，但仍输出上述 decode-step 统计。
 
 
 
@@ -42,11 +43,12 @@ export VLLM_TP_SIZE=16
 export VLLM_ENABLE_EXPERT_PARALLEL=1
 export VLLM_KVCACHE_BLOCK_SIZE=128
 export VLLM_ENFORCE_EAGER=0
+export VLLM_ENABLE_PROFILE=1
 
-# 在这里指定要 profile 的序列长度和 batchsize （这里相当于 bs
+# 这里相当于 bs=6, seqlen=30k
 export VLLM_PROMPT_LENGTHS=30000,30001,30002,30003,30004,30005
 
-# 至少为 4；推荐 8～16，以便采到多个稳定 decode step。
+# 推荐 8～16，以便采到多个稳定 decode step。
 export VLLM_MAX_GEN_TOKENS=8
 
 # vLLM chunk-prefill 每个 engine step 的总 token budget。
@@ -57,8 +59,11 @@ export VLLM_GPU_MEMORY_UTILIZATION=0.95
 export VLLM_PROFILE_GLOBAL_RANK=0
 export VLLM_PROFILE_DIR=$PWD/profiles/tp16_bs6_seq30k_$(date +%Y%m%d_%H%M%S)
 
-# 运行推理
-PYTHONPATH=$PWD:$PYTHONPATH python3 profile_vllm.py 2>&1 | tee profile_vllm.log
+# 运行推理（不采 profile，只打印 decode-step TPOT，不会等待 profile 落盘，避免 profile 开销）
+VLLM_ENABLE_PROFILE=0 PYTHONPATH=$PWD:$PYTHONPATH python3 profile_vllm.py
+
+# 运行推理（采 profile，同时打印相同口径的 decode-step TPOT）
+VLLM_ENABLE_PROFILE=1 VLLM_PROFILE_DIR=$PWD/profiles/with_profile_$(date +%Y%m%d_%H%M%S) PYTHONPATH=$PWD:$PYTHONPATH python3 profile_vllm.py
 ```
 
 
@@ -67,6 +72,7 @@ PYTHONPATH=$PWD:$PYTHONPATH python3 profile_vllm.py 2>&1 | tee profile_vllm.log
 
 | 参数                          |                    默认值 | 说明                                                         |
 | ----------------------------- | ------------------------: | ------------------------------------------------------------ |
+| `VLLM_ENABLE_PROFILE`         |                       `1` | `0`：只打印 decode 统计；`1`：同时采集 profile              |
 | `VLLM_PROFILE_DIR`            | 带时间戳的 `profiles/...` | profile 输出目录，运行前会自动创建。必须是不存在或为空的目录，避免多次结果混在一起。 |
 | `VLLM_PROFILE_GLOBAL_RANK`    |                       `0` | 唯一采集的 global rank；TP-only 时等同 TP rank               |
 | `VLLM_MAX_NUM_BATCHED_TOKENS` |                    `8192` | chunk-prefill 每步总 token budget                            |
@@ -85,7 +91,7 @@ effective runtime config: cudagraph_mode=...FULL_DECODE_ONLY..., capture_sizes=[
 runtime: native vLLM + vLLM-Ascend baseline
 ```
 
-profile 控制必须依次出现：
+`VLLM_ENABLE_PROFILE=1` 时，profile 控制必须依次出现：
 
 ```text
 VLLM_BASELINE_PROFILE_ARMED rank=0 expected_batch=6
@@ -100,6 +106,13 @@ VLLM_BASELINE_PROFILE_NOT_STARTED
 ```
 
 说明运行期间没有形成 BS6 的纯 single-token decode step。优先检查 prompt 长度是否过于悬殊、生成 token 是否太少，以及 KV cache 是否足以让全部请求同时驻留。
+
+`VLLM_ENABLE_PROFILE=0` 时不会出现上述 profile marker，而会打印：
+
+```text
+profiling is disabled; decode-step statistics remain enabled
+profile disabled by VLLM_ENABLE_PROFILE=0
+```
 
 
 
@@ -117,6 +130,8 @@ VLLM_DECODE_STEP_LOG_END
 
 
 ## 解析并用 MindStudio Insight 查看输出的 profile
+
+本节只适用于 `VLLM_ENABLE_PROFILE=1`。
 
 先找到唯一的 rank-0 原始目录：
 
@@ -144,4 +159,3 @@ find "$RAW_PROFILE_DIR" -path '*/ASCEND_PROFILER_OUTPUT/trace_view.json'
 ```
 
 使用 MindStudio Insight 打开 `trace_view.json` 或其所在的`ASCEND_PROFILER_OUTPUT` 目录。重点观察中间几个稳定 decode step；首次 decode step 可能包含 profiler 启动开销，不用于 TPOT 对比。
-
