@@ -193,8 +193,15 @@ def main() -> None:
                 f"{profile_dir}"
             )
         profile_dir.mkdir(parents=True, exist_ok=True)
+    # Offline LLM mode has one DP EngineCore. Preserve the legacy TP-rank
+    # selector while also populating the topology-aware variables used by the
+    # same worker and scheduler under online DP serving.
     os.environ["VLLM_PROFILE_EXPECTED_BATCH_SIZE"] = str(batch_size)
+    os.environ["VLLM_PROFILE_TRIGGER_BATCH_SIZE"] = str(batch_size)
     os.environ["VLLM_PROFILE_GLOBAL_RANK"] = str(target_rank)
+    os.environ["VLLM_PROFILE_TARGET_DP_RANK"] = "0"
+    os.environ["VLLM_PROFILE_TARGET_TP_RANK"] = str(target_rank)
+    os.environ["VLLM_DECODE_LOG_DP_RANK"] = "0"
 
     # Imported after PYTHONPATH and profiler-control environment are finalized;
     # spawned TP workers inherit both values.

@@ -1,4 +1,4 @@
-"""Parse the single rank-0 Ascend profile under VLLM_PROFILE_DIR."""
+"""Parse the single selected-worker Ascend profile under VLLM_PROFILE_DIR."""
 
 from __future__ import annotations
 
@@ -14,8 +14,8 @@ ANALYSIS_DIR_NAME = "ASCEND_PROFILER_OUTPUT"
 def _parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
         description=(
-            "Find and parse the single rank-0 *ascend_pt directory produced "
-            "by profile_vllm.py."
+            "Find and parse the single selected-worker *ascend_pt directory "
+            "produced by offline generation or online serving."
         )
     )
     parser.add_argument(
@@ -62,7 +62,7 @@ def _find_unique_raw_profile(profile_root: Path) -> Path:
     if len(candidates) != 1:
         formatted = "\n".join(f"  - {path}" for path in candidates)
         raise SystemExit(
-            "Expected exactly one rank-0 raw profile directory, found "
+            "Expected exactly one selected-worker raw profile directory, found "
             f"{len(candidates)} under {profile_root}:\n{formatted}"
         )
     return candidates[0]

@@ -9,6 +9,16 @@ from typing import Any
 from vllm.v1.core.sched.scheduler import Scheduler
 
 from vllm_decode_profile.profile_common import single_token_decode_info
+from vllm_decode_profile.profile_env import (
+    env_non_negative_float,
+    env_non_negative_int,
+)
+
+
+PROFILE_DP_RANK_ENV = "VLLM_PROFILE_TARGET_DP_RANK"
+DECODE_LOG_DP_RANK_ENV = "VLLM_DECODE_LOG_DP_RANK"
+DECODE_LOG_FLUSH_STEPS_ENV = "VLLM_DECODE_LOG_FLUSH_STEPS"
+DECODE_LOG_FLUSH_SECONDS_ENV = "VLLM_DECODE_LOG_FLUSH_SECONDS"
 
 
 @dataclass(frozen=True)
@@ -33,10 +43,43 @@ class _CompletedDecodeStep:
 
 
 class DecodeStepLoggingScheduler(Scheduler):
-    """Measure pure decode EngineCore steps without per-step stdout I/O."""
+    """Measure pure decode steps on one selected DP EngineCore.
+
+    A Scheduler belongs to a DP EngineCore rather than an individual TP
+    worker. Selecting one DP rank is therefore sufficient for DP=32, TP=1.
+    """
 
     def __init__(self, *args: Any, **kwargs: Any) -> None:
         super().__init__(*args, **kwargs)
+        self._decode_log_dp_rank = int(
+            self.parallel_config.data_parallel_rank
+        )
+        default_target_dp_rank = env_non_negative_int(
+            PROFILE_DP_RANK_ENV,
+            0,
+        )
+        self._decode_log_target_dp_rank = env_non_negative_int(
+            DECODE_LOG_DP_RANK_ENV,
+            default_target_dp_rank,
+        )
+        dp_size = int(self.parallel_config.data_parallel_size)
+        if self._decode_log_target_dp_rank >= dp_size:
+            raise RuntimeError(
+                f"{DECODE_LOG_DP_RANK_ENV} must be in [0, {dp_size}), got "
+                f"{self._decode_log_target_dp_rank}"
+            )
+        self._decode_log_enabled = (
+            self._decode_log_dp_rank == self._decode_log_target_dp_rank
+        )
+        self._decode_log_flush_steps = env_non_negative_int(
+            DECODE_LOG_FLUSH_STEPS_ENV,
+            0,
+        )
+        self._decode_log_flush_seconds = env_non_negative_float(
+            DECODE_LOG_FLUSH_SECONDS_ENV,
+            0.0,
+        )
+        self._decode_log_last_flush = perf_counter()
         self._decode_step_index = 0
         self._pending_decode_steps: dict[int, _PendingDecodeStep] = {}
         self._completed_decode_steps: list[_CompletedDecodeStep] = []
@@ -50,6 +93,9 @@ class DecodeStepLoggingScheduler(Scheduler):
         return max(0, total - free), total
 
     def schedule(self) -> Any:
+        if not self._decode_log_enabled:
+            return super().schedule()
+
         step_start = perf_counter()
         scheduler_output = super().schedule()
         decode_info = single_token_decode_info(scheduler_output)
@@ -73,9 +119,10 @@ class DecodeStepLoggingScheduler(Scheduler):
         scheduler_output: Any,
         model_runner_output: Any,
     ) -> Any:
-        pending = self._pending_decode_steps.pop(
-            id(scheduler_output),
-            None,
+        pending = (
+            self._pending_decode_steps.pop(id(scheduler_output), None)
+            if self._decode_log_enabled
+            else None
         )
         outputs = super().update_from_output(
             scheduler_output,
@@ -95,19 +142,39 @@ class DecodeStepLoggingScheduler(Scheduler):
                 )
             )
 
-        # Defer all stdout until the request set is finished. Immediate prints
-        # would enlarge the idle gap before the next decode step in the trace.
-        if not self.has_unfinished_requests():
-            self._flush_decode_step_log()
+        # Batch stdout until idle or an explicitly configured periodic limit.
+        # Per-step prints would enlarge gaps between decode steps in the trace.
+        if self._decode_log_enabled and self._completed_decode_steps:
+            flush_reason = self._decode_log_flush_reason()
+            if flush_reason is not None:
+                self._flush_decode_step_log(flush_reason)
         return outputs
 
-    def _flush_decode_step_log(self) -> None:
+    def _decode_log_flush_reason(self) -> str | None:
+        if not self.has_unfinished_requests():
+            return "idle"
+        if (
+            self._decode_log_flush_steps
+            and len(self._completed_decode_steps)
+            >= self._decode_log_flush_steps
+        ):
+            return "step_limit"
+        if (
+            self._decode_log_flush_seconds
+            and perf_counter() - self._decode_log_last_flush
+            >= self._decode_log_flush_seconds
+        ):
+            return "time_limit"
+        return None
+
+    def _flush_decode_step_log(self, reason: str) -> None:
         if not self._completed_decode_steps:
             return
 
         lines = [
             "VLLM_DECODE_STEP_LOG_BEGIN "
-            f"count={len(self._completed_decode_steps)}"
+            f"dp_rank={self._decode_log_dp_rank} "
+            f"count={len(self._completed_decode_steps)} reason={reason}"
         ]
         for record in self._completed_decode_steps:
             kv_percent = (
@@ -116,7 +183,8 @@ class DecodeStepLoggingScheduler(Scheduler):
                 else 0.0
             )
             lines.append(
-                f"[VLLM_DECODE step={record.step:04d}] "
+                f"[VLLM_DECODE step={record.step:04d} "
+                f"dp_rank={self._decode_log_dp_rank}] "
                 f"bsz={record.batch_size}, "
                 f"num_tokens={record.num_tokens}, "
                 f"TPOT={record.tpot_ms:.3f} ms, "
@@ -127,7 +195,9 @@ class DecodeStepLoggingScheduler(Scheduler):
         lines.append("VLLM_DECODE_STEP_LOG_END")
         print("\n".join(lines), flush=True)
         self._completed_decode_steps.clear()
+        self._decode_log_last_flush = perf_counter()
 
     def shutdown(self) -> None:
-        self._flush_decode_step_log()
+        if self._decode_log_enabled:
+            self._flush_decode_step_log(reason="shutdown")
         super().shutdown()
