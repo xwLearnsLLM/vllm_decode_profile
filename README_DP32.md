@@ -79,11 +79,14 @@ npu-smi info
 可分别检查本机 IP：
 
 ```bash
-ip -o -4 addr show
+hostname -I
+ls /sys/class/net
 ```
 
 脚本会根据预设 IP 自动找到对应的网卡名，并将其写入 HCCL、Gloo 和 TP 的网卡
-环境变量，不需要手工填写 `eth0`、`enp*` 等接口名。
+环境变量。它会优先使用系统的 `ip` 命令；精简系统没有安装 `iproute` 时，会
+自动改用 Python 标准库探测，因此不要求额外安装系统包。也可以通过
+`VLLM_NIC_NAME` 直接指定 `eth0`、`enp*` 等接口名。
 
 ## 2. 启动双机服务
 
@@ -256,6 +259,7 @@ python3 parse_profile.py /实际路径/vllm_decode_profile/profiles/dp32_decode_
 | --- | --- | --- | --- |
 | `VLLM_NODE_LOCAL_IP` | `10.44.53.212` | `10.44.53.215` | 当前节点用于通信的 IP |
 | `VLLM_NODE0_IP` | `10.44.53.212` | `10.44.53.212` | DP coordinator 地址 |
+| `VLLM_NIC_NAME` | 根据本机 IP 自动探测 | 同左 | HCCL、Gloo 和 TP 使用的网卡名 |
 | `VLLM_MODEL` | `/mnt/models/GLM-5.1-w4a8` | 同左 | 本地模型目录 |
 | `ASCEND_RT_VISIBLE_DEVICES` | `0,1,2,3,4,5,6,7,8,9,10,11,12,13,14,15` | 同左 | 当前节点使用的 16 张 NPU |
 | `VLLM_PROFILE_TARGET_DP_RANK` | `0` | `0` | 唯一采集 profile 的全局 DP rank |
@@ -282,9 +286,16 @@ export VLLM_PROFILE_MAX_DECODE_STEPS=4
 
 ### `no network interface found for local IP`
 
-脚本没有在本机发现预设 IP。执行 `ip -o -4 addr show` 核对地址；如果机器 IP
-发生变化，用 `VLLM_NODE_LOCAL_IP` 覆盖当前节点 IP，并确保
-`VLLM_NODE0_IP` 始终指向 master。
+脚本没有在本机发现预设 IP。先用 `hostname -I` 核对地址，并用
+`ls /sys/class/net` 查看网卡名。如果 IP 正确但仍无法自动匹配，可以直接指定：
+
+```bash
+VLLM_NIC_NAME=实际网卡名 bash run_dp32/master.sh
+```
+
+headless 节点对应执行 `headless.sh`。如果机器 IP 已发生变化，同时用
+`VLLM_NODE_LOCAL_IP` 覆盖当前节点 IP，并确保 `VLLM_NODE0_IP` 始终指向
+master。
 
 ### `VLLM_PROFILE_DIR must be empty`
 
@@ -306,7 +317,8 @@ export VLLM_PROFILE_MAX_DECODE_STEPS=4
 先确认两台机器使用相同的模型权重和兼容的软件版本，再检查：
 
 ```bash
-ip -o -4 addr show
+hostname -I
+ls /sys/class/net
 npu-smi info
 vllm --version
 python3 -c 'import vllm, vllm_ascend, torch_npu; print("imports OK")'

@@ -6,14 +6,60 @@ set -euo pipefail
 local_ip="${VLLM_NODE_LOCAL_IP:-10.44.53.215}"
 node0_ip="${VLLM_NODE0_IP:-10.44.53.212}"
 model_path="${VLLM_MODEL:-/mnt/models/GLM-5.1-w4a8}"
-nic_name="$(
-  ip -o -4 addr show |
-    awk -v ip="$local_ip" \
-      '{split($4, addr, "/"); if (addr[1] == ip) {print $2; exit}}'
-)"
+nic_name="${VLLM_NIC_NAME:-}"
+
+if [ -z "$nic_name" ] && command -v ip >/dev/null 2>&1; then
+  nic_name="$(
+    ip -o -4 addr show |
+      awk -v ip="$local_ip" '
+        {
+          split($4, addr, "/")
+          if (addr[1] == ip) {
+            name = $2
+            sub(/@.*/, "", name)
+            print name
+            exit
+          }
+        }
+      ' || true
+  )"
+fi
+
+if [ -z "$nic_name" ] && command -v python3 >/dev/null 2>&1; then
+  nic_name="$(
+    python3 - "$local_ip" 2>/dev/null <<'PY' || true
+import fcntl
+import os
+import socket
+import struct
+import sys
+
+target_ip = sys.argv[1]
+for interface in sorted(os.listdir("/sys/class/net")):
+    sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+    try:
+        request = struct.pack("256s", interface[:15].encode())
+        response = fcntl.ioctl(sock.fileno(), 0x8915, request)
+        interface_ip = socket.inet_ntoa(response[20:24])
+    except OSError:
+        continue
+    finally:
+        sock.close()
+    if interface_ip == target_ip:
+        print(interface)
+        break
+PY
+  )"
+fi
 
 if [ -z "$nic_name" ]; then
   echo "Error: no network interface found for local IP $local_ip" >&2
+  echo "Set it explicitly, for example: VLLM_NIC_NAME=eth0 bash run_dp32/headless.sh" >&2
+  exit 1
+fi
+
+if [ ! -d "/sys/class/net/$nic_name" ]; then
+  echo "Error: network interface does not exist: $nic_name" >&2
   exit 1
 fi
 
