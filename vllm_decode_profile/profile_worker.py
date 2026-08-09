@@ -12,12 +12,13 @@ from typing import Any
 
 from vllm_ascend.worker.worker import NPUWorker
 
-from vllm_decode_profile.profile_common import single_token_decode_info
+from vllm_decode_profile.profile_common import decode_step_info
 
 
 LOGGER = logging.getLogger(__name__)
 EXPECTED_BATCH_ENV = "VLLM_PROFILE_EXPECTED_BATCH_SIZE"
 PROFILE_RANK_ENV = "VLLM_PROFILE_GLOBAL_RANK"
+SPECULATIVE_TOKENS_ENV = "VLLM_PROFILE_NUM_SPECULATIVE_TOKENS"
 
 
 def _required_non_negative_int(name: str) -> int:
@@ -44,6 +45,14 @@ class DecodeOnlyRankFilteredNPUWorker(NPUWorker):
         if self._profile_expected_batch_size == 0:
             raise RuntimeError(f"{EXPECTED_BATCH_ENV} must be greater than zero")
         self._profile_target_rank = _required_non_negative_int(PROFILE_RANK_ENV)
+        self._profile_num_speculative_tokens = _required_non_negative_int(
+            SPECULATIVE_TOKENS_ENV
+        )
+        if self._profile_num_speculative_tokens not in (0, 3):
+            raise RuntimeError(
+                f"{SPECULATIVE_TOKENS_ENV} supports only 0 or 3, got "
+                f"{self._profile_num_speculative_tokens}"
+            )
         self._decode_profile_armed = False
         self._decode_profile_started = False
         self._decode_profile_prefix: str | None = None
@@ -51,11 +60,17 @@ class DecodeOnlyRankFilteredNPUWorker(NPUWorker):
     def _is_target_rank(self) -> bool:
         return int(self.rank) == self._profile_target_rank
 
-    def _is_full_batch_single_token_decode(self, scheduler_output: Any) -> bool:
-        return single_token_decode_info(
+    def _is_full_batch_profile_decode(self, scheduler_output: Any) -> bool:
+        return decode_step_info(
             scheduler_output,
             expected_batch_size=self._profile_expected_batch_size,
+            num_speculative_tokens=self._profile_num_speculative_tokens,
         ) is not None
+
+    def _profile_phase(self) -> str:
+        if self._profile_num_speculative_tokens:
+            return f"mtp{self._profile_num_speculative_tokens}_decode"
+        return "decode"
 
     def profile(
         self,
@@ -77,10 +92,12 @@ class DecodeOnlyRankFilteredNPUWorker(NPUWorker):
             self._decode_profile_armed = True
             self._decode_profile_prefix = profile_prefix
             LOGGER.warning(
-                "VLLM_BASELINE_PROFILE_ARMED rank=%d expected_batch=%d; "
+                "VLLM_BASELINE_PROFILE_ARMED rank=%d expected_batch=%d "
+                "speculative_tokens=%d; "
                 "prefill will not be recorded.",
                 self.rank,
                 self._profile_expected_batch_size,
+                self._profile_num_speculative_tokens,
             )
             return
 
@@ -93,8 +110,9 @@ class DecodeOnlyRankFilteredNPUWorker(NPUWorker):
         elif was_armed:
             LOGGER.warning(
                 "VLLM_BASELINE_PROFILE_NOT_STARTED rank=%d: no full-batch "
-                "single-token decode step was observed.",
+                "%s step was observed.",
                 self.rank,
+                self._profile_phase(),
             )
         self._decode_profile_prefix = None
 
@@ -103,12 +121,16 @@ class DecodeOnlyRankFilteredNPUWorker(NPUWorker):
             self._is_target_rank()
             and self._decode_profile_armed
             and not self._decode_profile_started
-            and self._is_full_batch_single_token_decode(scheduler_output)
+            and self._is_full_batch_profile_decode(scheduler_output)
         ):
             LOGGER.warning(
-                "VLLM_BASELINE_PROFILE_STARTED rank=%d batch=%d phase=decode",
+                "VLLM_BASELINE_PROFILE_STARTED rank=%d batch=%d phase=%s "
+                "scheduled_tokens=%d",
                 self.rank,
                 self._profile_expected_batch_size,
+                self._profile_phase(),
+                self._profile_expected_batch_size
+                * (1 + self._profile_num_speculative_tokens),
             )
             super().profile(
                 is_start=True,

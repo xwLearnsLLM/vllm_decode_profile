@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import json
 import os
 import sys
 import time
@@ -12,8 +13,18 @@ DEFAULT_MODEL_PATH = "/home/models/DeepSeek-V3.2-REAP-345B-A37B-BF16/"
 DEFAULT_TP_SIZE = 16
 DEFAULT_PROMPT_LENGTHS = "8200,8201"
 DEFAULT_MAX_GEN_TOKENS = 8
+DEFAULT_MTP_MAX_GEN_TOKENS = 16
 DEFAULT_MAX_NUM_BATCHED_TOKENS = 8192
+MTP_SPECULATIVE_TOKENS = 3
 BASELINE_ALL2ALL_BACKEND = "flashinfer_all2allv"
+PROFILE_SPECULATIVE_TOKENS_ENV = (
+    "VLLM_PROFILE_NUM_SPECULATIVE_TOKENS"
+)
+DEFAULT_GLM_MTP_ADDITIONAL_CONFIG = {
+    "fuse_muls_add": True,
+    "multistream_overlap_shared_expert": True,
+    "ascend_compilation_config": {"enable_npugraph_ex": True},
+}
 WORKER_CLASS = (
     "vllm_decode_profile.profile_worker.DecodeOnlyRankFilteredNPUWorker"
 )
@@ -50,6 +61,22 @@ def env_float(name: str, default: float) -> float:
     return default if value is None else float(value)
 
 
+def env_json_object(
+    name: str,
+    default: dict | None = None,
+) -> dict | None:
+    value = os.environ.get(name)
+    if value is None:
+        return default
+    try:
+        parsed = json.loads(value)
+    except json.JSONDecodeError as exc:
+        raise ValueError(f"{name} must be valid JSON") from exc
+    if not isinstance(parsed, dict):
+        raise ValueError(f"{name} must contain a JSON object")
+    return parsed
+
+
 def parse_prompt_lengths() -> list[int]:
     value = os.environ.get("VLLM_PROMPT_LENGTHS", DEFAULT_PROMPT_LENGTHS)
     lengths = [int(item.strip()) for item in value.split(",") if item.strip()]
@@ -68,16 +95,27 @@ def _tp_size() -> int:
     return env_int("VLLM_TP_SIZE", DEFAULT_TP_SIZE)
 
 
-def _max_gen_tokens() -> int:
-    return env_int("VLLM_MAX_GEN_TOKENS", DEFAULT_MAX_GEN_TOKENS)
+def _max_gen_tokens(enable_mtp: bool) -> int:
+    default = (
+        DEFAULT_MTP_MAX_GEN_TOKENS
+        if enable_mtp
+        else DEFAULT_MAX_GEN_TOKENS
+    )
+    return env_int("VLLM_MAX_GEN_TOKENS", default)
 
 
-def _profile_dir(tp_size: int, batch_size: int) -> Path:
+def _profile_dir(
+    tp_size: int,
+    batch_size: int,
+    enable_mtp: bool,
+) -> Path:
+    decode_mode = "mtp3" if enable_mtp else "decode"
     default_dir = (
         REPO_ROOT
         / "profiles"
         / (
-            f"vllm_baseline_tp{tp_size}_bs{batch_size}_full_decode_only_"
+            f"vllm_baseline_tp{tp_size}_bs{batch_size}_{decode_mode}_"
+            "full_decode_only_"
             f"{time.strftime('%Y%m%d_%H%M%S')}"
         )
     )
@@ -101,6 +139,8 @@ def _print_effective_runtime_config(
     llm,
     enable_expert_parallel: bool,
     batch_size: int,
+    enable_mtp: bool,
+    mtp_drafter_enforce_eager: bool,
 ) -> None:
     config = llm.llm_engine.vllm_config.compilation_config
     mode = getattr(config, "cudagraph_mode", None)
@@ -112,22 +152,40 @@ def _print_effective_runtime_config(
         "scheduler_cls",
         None,
     )
+    speculative_config = llm.llm_engine.vllm_config.speculative_config
+    speculative_method = getattr(speculative_config, "method", None)
+    speculative_tokens = getattr(
+        speculative_config,
+        "num_speculative_tokens",
+        0,
+    )
+    speculative_enforce_eager = getattr(
+        speculative_config,
+        "enforce_eager",
+        None,
+    )
+    expected_capture_size = batch_size * (
+        1 + (MTP_SPECULATIVE_TOKENS if enable_mtp else 0)
+    )
     print(
         "effective runtime config: "
         f"cudagraph_mode={mode}, capture_sizes={capture_sizes}, "
         f"all2all_backend={all2all_backend}, scheduler_cls={scheduler_cls}"
+        f", speculative_method={speculative_method}, "
+        f"speculative_tokens={speculative_tokens}, "
+        f"speculative_enforce_eager={speculative_enforce_eager}"
     )
     if "FULL_DECODE_ONLY" not in str(mode):
         raise RuntimeError(
             "vLLM did not retain cudagraph_mode=FULL_DECODE_ONLY; "
             "do not use this run as the graph baseline"
         )
-    if capture_sizes is None or batch_size not in {
+    if capture_sizes is None or expected_capture_size not in {
         int(size) for size in capture_sizes
     }:
         raise RuntimeError(
             "vLLM did not retain the requested decode graph capture size "
-            f"{batch_size}; got {capture_sizes!r}"
+            f"{expected_capture_size}; got {capture_sizes!r}"
         )
     if (
         enable_expert_parallel
@@ -142,6 +200,27 @@ def _print_effective_runtime_config(
             "vLLM did not retain the decode-step logging scheduler; "
             f"got {scheduler_cls!r}"
         )
+    if enable_mtp:
+        if speculative_method != "mtp":
+            raise RuntimeError(
+                "vLLM did not retain method=mtp; got "
+                f"{speculative_method!r}"
+            )
+        if speculative_tokens != MTP_SPECULATIVE_TOKENS:
+            raise RuntimeError(
+                "vLLM did not retain MTP3; got num_speculative_tokens="
+                f"{speculative_tokens!r}"
+            )
+        if speculative_enforce_eager != mtp_drafter_enforce_eager:
+            raise RuntimeError(
+                "vLLM did not retain the requested MTP drafter eager mode; "
+                f"got {speculative_enforce_eager!r}"
+            )
+    elif speculative_config is not None:
+        raise RuntimeError(
+            "vLLM unexpectedly enabled speculative decoding for the "
+            "autoregressive baseline"
+        )
 
 
 def main() -> None:
@@ -150,29 +229,56 @@ def main() -> None:
     prompt_lengths = parse_prompt_lengths()
     batch_size = len(prompt_lengths)
     tp_size = _tp_size()
-    max_gen_tokens = _max_gen_tokens()
+    enable_mtp = env_bool("VLLM_ENABLE_MTP", False)
+    num_speculative_tokens = (
+        MTP_SPECULATIVE_TOKENS if enable_mtp else 0
+    )
+    decode_tokens_per_request = 1 + num_speculative_tokens
+    capture_size = batch_size * decode_tokens_per_request
+    max_gen_tokens = _max_gen_tokens(enable_mtp)
     max_model_len = max(prompt_lengths) + max_gen_tokens
     max_num_batched_tokens = env_int(
         "VLLM_MAX_NUM_BATCHED_TOKENS",
         DEFAULT_MAX_NUM_BATCHED_TOKENS,
     )
     enable_profile = env_bool("VLLM_ENABLE_PROFILE", True)
+    mtp_drafter_enforce_eager = env_bool(
+        "VLLM_MTP_DRAFTER_ENFORCE_EAGER",
+        True,
+    )
+    quantization = os.environ.get("VLLM_QUANTIZATION")
+    if enable_mtp and quantization is None:
+        quantization = "ascend"
+    additional_config = env_json_object(
+        "VLLM_ADDITIONAL_CONFIG",
+        DEFAULT_GLM_MTP_ADDITIONAL_CONFIG if enable_mtp else {},
+    )
+    assert additional_config is not None
     target_rank = env_int("VLLM_PROFILE_GLOBAL_RANK", 0)
     profile_dir = (
-        _profile_dir(tp_size, batch_size) if enable_profile else None
+        _profile_dir(tp_size, batch_size, enable_mtp)
+        if enable_profile
+        else None
     )
     prefill_chunk_tokens = env_int(
         "VLLM_PREFILL_CHUNK_TOKENS",
         max(1, max_num_batched_tokens // batch_size),
     )
 
-    if max_gen_tokens < 2:
+    minimum_gen_tokens = (
+        MTP_SPECULATIVE_TOKENS + 2 if enable_mtp else 2
+    )
+    if max_gen_tokens < minimum_gen_tokens:
         raise ValueError(
-            "VLLM_MAX_GEN_TOKENS must be at least 2 so that a decode step "
-            "exists"
+            "VLLM_MAX_GEN_TOKENS must be at least "
+            f"{minimum_gen_tokens} so that a complete "
+            f"{'MTP3 verification' if enable_mtp else 'decode'} step exists"
         )
-    if max_num_batched_tokens < batch_size:
-        raise ValueError("VLLM_MAX_NUM_BATCHED_TOKENS must be >= batch size")
+    if max_num_batched_tokens < capture_size:
+        raise ValueError(
+            "VLLM_MAX_NUM_BATCHED_TOKENS must be >= the full decode "
+            f"verification size ({capture_size})"
+        )
     if prefill_chunk_tokens <= 0:
         raise ValueError("VLLM_PREFILL_CHUNK_TOKENS must be positive")
     if not 0 <= target_rank < tp_size:
@@ -195,6 +301,9 @@ def main() -> None:
         profile_dir.mkdir(parents=True, exist_ok=True)
     os.environ["VLLM_PROFILE_EXPECTED_BATCH_SIZE"] = str(batch_size)
     os.environ["VLLM_PROFILE_GLOBAL_RANK"] = str(target_rank)
+    os.environ[PROFILE_SPECULATIVE_TOKENS_ENV] = str(
+        num_speculative_tokens
+    )
 
     # Imported after PYTHONPATH and profiler-control environment are finalized;
     # spawned TP workers inherit both values.
@@ -211,9 +320,13 @@ def main() -> None:
         "VLLM_ENABLE_EXPERT_PARALLEL",
         True,
     )
+    decode_mode = (
+        f"mtp{num_speculative_tokens}" if enable_mtp else "decode"
+    )
     profile_prefix = (
         f"vllm_baseline_tp{tp_size}_bs{batch_size}_"
-        f"seq{min(prompt_lengths)}_{max(prompt_lengths)}_full_decode_only"
+        f"seq{min(prompt_lengths)}_{max(prompt_lengths)}_{decode_mode}_"
+        "full_decode_only"
     )
 
     print(
@@ -223,6 +336,11 @@ def main() -> None:
         f"max_model_len={max_model_len}, max_gen_tokens={max_gen_tokens}, "
         f"max_num_batched_tokens={max_num_batched_tokens}, "
         f"per_request_prefill_chunk_cap={prefill_chunk_tokens}, "
+        f"decode_mode={decode_mode}, capture_size={capture_size}, "
+        f"quantization={quantization}, "
+        "mtp_drafter_enforce_eager="
+        f"{mtp_drafter_enforce_eager if enable_mtp else 'n/a'}, "
+        f"additional_config={additional_config}, "
         f"all2all_backend={BASELINE_ALL2ALL_BACKEND}, "
         f"profile_enabled={enable_profile}, "
         f"profile_global_rank={target_rank}, "
@@ -234,6 +352,8 @@ def main() -> None:
         model=model_path,
         tensor_parallel_size=tp_size,
         enable_expert_parallel=enable_expert_parallel,
+        quantization=quantization,
+        additional_config=additional_config,
         # vLLM-Ascend normally selects this while resolving worker_cls="auto".
         # Our profiling-only worker subclass bypasses that branch, so preserve
         # the baseline backend explicitly.
@@ -261,10 +381,19 @@ def main() -> None:
         trust_remote_code=True,
         enforce_eager=False,
         worker_cls=WORKER_CLASS,
+        speculative_config=(
+            {
+                "method": "deepseek_mtp",
+                "num_speculative_tokens": MTP_SPECULATIVE_TOKENS,
+                "enforce_eager": mtp_drafter_enforce_eager,
+            }
+            if enable_mtp
+            else None
+        ),
         compilation_config={
             "mode": "VLLM_COMPILE",
             "cudagraph_mode": "FULL_DECODE_ONLY",
-            "cudagraph_capture_sizes": [batch_size],
+            "cudagraph_capture_sizes": [capture_size],
         },
         profiler_config=(
             {
@@ -282,6 +411,8 @@ def main() -> None:
         llm,
         enable_expert_parallel,
         batch_size,
+        enable_mtp,
+        mtp_drafter_enforce_eager,
     )
 
     tokenizer = llm.get_tokenizer()
@@ -311,10 +442,15 @@ def main() -> None:
     )
 
     if enable_profile:
+        trigger_description = (
+            "MTP3 verification (1 ordinary + 3 draft tokens per request)"
+            if enable_mtp
+            else "pure single-token decode"
+        )
         print(
             "profiling is armed now; "
             f"rank {target_rank} starts recording only when the full batch "
-            "reaches pure single-token decode"
+            f"reaches {trigger_description}"
         )
     else:
         print(
