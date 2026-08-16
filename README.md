@@ -27,22 +27,20 @@ MTP3 实现按以下官方版本和配置核对：
 ## 运行profile采集
 
 ```bash
-export VLLM_MODEL=/mnt/models/GLM-5.1-w4a8/         # set model path here
+export VLLM_MODEL=/home/models/GLM-5.2-w4a8/              # set model path here
 export VLLM_TP_SIZE=16
 export VLLM_ENABLE_EXPERT_PARALLEL=1
 export VLLM_QUANTIZATION=ascend
 export VLLM_MAX_NUM_BATCHED_TOKENS=4096
-export VLLM_GPU_MEMORY_UTILIZATION=0.88
+export VLLM_GPU_MEMORY_UTILIZATION=0.925
 export VLLM_KVCACHE_BLOCK_SIZE=128
 export VLLM_MTP_DRAFTER_ENFORCE_EAGER=0
-export VLLM_ENABLE_MTP=1                            # set 0 to disable MTP 
-export VLLM_PROMPT_LENGTHS=40000,40001,40002,40003  # seqlen=40k, bs=4 
-export VLLM_MAX_GEN_TOKENS=40                       # decode enough tokens
-export VLLM_PROFILE_GLOBAL_RANK=0                   # only profile rank0
-export VLLM_ENABLE_PROFILE=1                        # set to 0 will only print decode step time, without profile output 
-export VLLM_PROFILE_DIR=$PWD/vllm_seq40k_bs4_mtp    # set output profile path here 
+export VLLM_ENABLE_MTP=1                                  # set 0 to disable MTP 
+export VLLM_PROMPT_LENGTHS=65030,65031,65032,65033,65034  # seqlen=64k, bs=5 
+export VLLM_MAX_GEN_TOKENS=40                             # decode enough tokens
+export VLLM_PROFILE_GLOBAL_RANK=0                         # only profile rank0
+export VLLM_ENABLE_PROFILE=1                              # set to 0 will only print decode step time, without profile output 
+export VLLM_PROFILE_DIR=$PWD/mtp3_vllm_seq64k_bs5         # set output profile path here 
 PYTHONPATH=$PWD:$PYTHONPATH python3 profile_vllm.py
 python parse_profile.py
 ```
-
-
